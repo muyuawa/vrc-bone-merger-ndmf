@@ -272,7 +272,10 @@ namespace VRCBoneMerger
                 if (EditorGUI.EndChangeCheck()) Repaint();
                 EditorGUILayout.LabelField("父物体", group.parent.name);
                 EditorGUILayout.LabelField("完整路径", GetPath(group.parent), EditorStyles.miniLabel);
-                EditorGUILayout.LabelField(string.Format("预计：{0} 个来源组件 → {1} 个合并组件，减少 {2} 个 PhysBone", GetMergeEntries(group).Count, GetOutputComponentCount(group), GetPredictedReduction(group)), EditorStyles.miniLabel);
+                if (group.blocked)
+                    EditorGUILayout.LabelField(string.Format("检测到：{0} 个来源组件；已阻止自动合并", group.entries.Count), EditorStyles.miniLabel);
+                else
+                    EditorGUILayout.LabelField(string.Format("预计：{0} 个来源组件 → {1} 个合并组件，减少 {2} 个 PhysBone", GetMergeEntries(group).Count, GetOutputComponentCount(group), GetPredictedReduction(group)), EditorStyles.miniLabel);
                 if (group.ProfileCount > 1)
                     EditorGUILayout.HelpBox("这些根拥有相同数量、相同顺序的多套 PhysBone 配置。根只迁移一次，并在同一个合并根上生成对应数量的 PhysBone。", MessageType.Info);
                 EditorGUILayout.Space(5);
@@ -361,8 +364,8 @@ namespace VRCBoneMerger
                 }
 
                 MergeGroup group = parentGroups.FirstOrDefault(x => x.entries.Count > 0
-                    && VRCPhysBoneStrictCompatibility.AreEqualExceptRootTransform(
-                        x.entries[0].component, entry.component));
+                    && NdmfBoneMergePass.AreAutomaticMergeCompatible(
+                        x.entries[0].component, x.entries[0].root, entry.component, entry.root));
                 if (group == null)
                 {
                     group = new MergeGroup { parent = parent, targetName = "MergedPB_" + parent.name };
@@ -390,7 +393,7 @@ namespace VRCBoneMerger
                 if (candidateEntries.Contains(entry) || !string.IsNullOrEmpty(entry.skipReason)) continue;
                 if (entry.parent != null)
                 {
-                    entry.skipReason = "同父级但没有第二条实际生效参数一致的链";
+                    entry.skipReason = "同父级但没有第二条实际生效参数及有效链长均一致的链";
                 }
             }
 
@@ -429,8 +432,9 @@ namespace VRCBoneMerger
                     if (candidate[0].entries.Count != sequence.entries.Count) return false;
                     for (int index = 0; index < sequence.entries.Count; index++)
                     {
-                        if (!VRCPhysBoneStrictCompatibility.AreEqualExceptRootTransform(
-                                candidate[0].entries[index].component, sequence.entries[index].component))
+                        if (!NdmfBoneMergePass.AreAutomaticMergeCompatible(
+                                candidate[0].entries[index].component, candidate[0].entries[index].root,
+                                sequence.entries[index].component, sequence.entries[index].root))
                             return false;
                     }
                     return true;
@@ -451,8 +455,9 @@ namespace VRCBoneMerger
                 var familyRoots = new HashSet<Transform>(family.Select(x => x.root));
                 bool hasPartialOverlap = Enumerable.Range(0, family[0].entries.Count).Any(index =>
                     allEntries.Any(entry => !familyRoots.Contains(entry.root)
-                        && VRCPhysBoneStrictCompatibility.AreEqualExceptRootTransform(
-                            family[0].entries[index].component, entry.component)));
+                        && NdmfBoneMergePass.AreAutomaticMergeCompatible(
+                            family[0].entries[index].component, family[0].entries[index].root,
+                            entry.component, entry.root)));
                 if (hasPartialOverlap) continue;
                 var combined = new MergeGroup
                 {
@@ -521,7 +526,15 @@ namespace VRCBoneMerger
                 string safetyReason;
                 if (NdmfBoneMergePass.IsSafeAutomaticMerge(rootOfAvatar, allComponents,
                         profile.Select(x => x.component), animationSafety, out safetyReason,
-                        familyComponents)) continue;
+                        familyComponents))
+                {
+                    if (NdmfBoneMergePass.UsesNumericTolerance(profile.Select(x => x.component)))
+                    {
+                        const string toleranceWarning = "来源组件存在小幅数值差异（最大相对容差 12%）；合并后采用第一条来源链的数值。";
+                        if (!group.warnings.Contains(toleranceWarning)) group.warnings.Add(toleranceWarning);
+                    }
+                    continue;
+                }
                 group.blocked = true;
                 if (!group.warnings.Contains(safetyReason)) group.warnings.Add(safetyReason);
             }
@@ -791,6 +804,8 @@ namespace VRCBoneMerger
             {
                 VRCPhysBone merged = mergedObject.AddComponent<VRCPhysBone>();
                 EditorUtility.CopySerialized(profile[0].component, merged);
+                NdmfBoneMergePass.ApplyMergedCurveCorrection(merged,
+                    profile.Select(x => x.component), profile.Select(x => x.root));
                 NdmfBoneMergePass.ApplyMergedIgnoreTransforms(merged,
                     profile.Select(x => x.component), profile.Select(x => x.root));
                 ClearRootTransform(merged);

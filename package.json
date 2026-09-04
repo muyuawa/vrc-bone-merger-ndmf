@@ -1,6 +1,6 @@
 {
   "name": "com.local.vrc-bone-merger",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "displayName": "VRC Bone Merger (NDMF)",
   "description": "Non-destructive NDMF merger for effectively compatible VRChat PhysBone chains.",
   "unity": "2022.3",

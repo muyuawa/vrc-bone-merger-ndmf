@@ -109,6 +109,8 @@ namespace VRCBoneMerger
             int sharedProfileGroups = 0;
             foreach (MergePlan plan in plans)
             {
+                bool usesNumericTolerance = plan.profiles.Any(profile =>
+                    UsesNumericTolerance(profile.Select(x => x.component)));
                 List<Transform> roots = plan.Roots;
                 if (HasOverlappingRoots(roots))
                 {
@@ -159,9 +161,16 @@ namespace VRCBoneMerger
                                      + "; independent PhysBone grab states will become one shared state per configuration profile.");
                 }
 
+                if (usesNumericTolerance)
+                {
+                    Debug.LogWarning("[VRC Bone Merger] Merging a group with small numeric differences under "
+                                     + GetPath(plan.parent)
+                                     + "; the merged PhysBone uses values from the first source component.");
+                }
+
                 MergeOnBuildClone(context, plan.parent, plan.profiles, settings.generatedNamePrefix, components);
                 plan.merged = true;
-                plan.outcome = "已合并";
+                plan.outcome = usesNumericTolerance ? "已合并（使用数值容差）" : "已合并";
                 mergedGroups++;
                 mergedSources += plan.entries.Count;
                 mergedOutputs += plan.profiles.Count;
@@ -193,8 +202,8 @@ namespace VRCBoneMerger
             var groups = new List<List<BoneEntry>>();
             foreach (BoneEntry entry in entries)
             {
-                List<BoneEntry> group = groups.FirstOrDefault(x =>
-                    VRCPhysBoneStrictCompatibility.AreEqualExceptRootTransform(x[0].component, entry.component));
+                List<BoneEntry> group = groups.FirstOrDefault(x => AreAutomaticMergeCompatible(
+                    x[0].component, x[0].root, entry.component, entry.root));
                 if (group == null)
                 {
                     group = new List<BoneEntry>();
@@ -233,8 +242,9 @@ namespace VRCBoneMerger
                     if (candidate[0].entries.Count != sequence.entries.Count) return false;
                     for (int index = 0; index < sequence.entries.Count; index++)
                     {
-                        if (!VRCPhysBoneStrictCompatibility.AreEqualExceptRootTransform(
-                                candidate[0].entries[index].component, sequence.entries[index].component))
+                        if (!AreAutomaticMergeCompatible(
+                                candidate[0].entries[index].component, candidate[0].entries[index].root,
+                                sequence.entries[index].component, sequence.entries[index].root))
                             return false;
                     }
                     return true;
@@ -256,8 +266,8 @@ namespace VRCBoneMerger
                 var familyRoots = new HashSet<Transform>(family.Select(x => x.root));
                 bool hasPartialOverlap = orderedProfiles.Any(profile => entries.Any(entry =>
                     !familyRoots.Contains(entry.root)
-                    && VRCPhysBoneStrictCompatibility.AreEqualExceptRootTransform(
-                        profile[0].component, entry.component)));
+                    && AreAutomaticMergeCompatible(
+                        profile[0].component, profile[0].root, entry.component, entry.root)));
                 if (hasPartialOverlap) continue;
                 result.Add(new MergePlan(parent, orderedProfiles));
                 foreach (BoneEntry entry in family.SelectMany(x => x.entries)) consumed.Add(entry);
@@ -271,6 +281,28 @@ namespace VRCBoneMerger
                 result.Add(new MergePlan(parent, new List<List<BoneEntry>> { remaining }));
             }
             return result;
+        }
+
+        internal static bool AreAutomaticMergeCompatible(VRCPhysBone left, Transform leftRoot,
+            VRCPhysBone right, Transform rightRoot)
+        {
+            if (left == null || right == null || leftRoot == null || rightRoot == null) return false;
+            if (!VRCPhysBoneStrictCompatibility.AreEqualExceptRootTransform(left, right))
+                return false;
+
+            // A merged PhysBone has only one curve for all of its branches. Keep
+            // branches with different effective lengths in separate groups so the
+            // curve values sampled by the original bones remain equivalent.
+            if (!VRCPhysBoneStrictCompatibility.HasAnyEffectiveCurve(left)) return true;
+            return GetBoneChainLength(leftRoot, left) == GetBoneChainLength(rightRoot, right);
+        }
+
+        internal static bool UsesNumericTolerance(IEnumerable<VRCPhysBone> sourceComponents)
+        {
+            VRCPhysBone[] sources = sourceComponents.Where(x => x != null).ToArray();
+            if (sources.Length < 2) return false;
+            return sources.Skip(1).Any(source =>
+                !VRCPhysBoneStrictCompatibility.AreExactlyEqualExceptRootTransform(sources[0], source));
         }
 
         internal static bool IsSafeAutomaticMerge(Transform avatarRoot, VRCPhysBone[] allComponents,
@@ -423,6 +455,8 @@ namespace VRCBoneMerger
             {
                 VRCPhysBone merged = mergedObject.AddComponent<VRCPhysBone>();
                 EditorUtility.CopySerialized(profile[0].component, merged);
+                ApplyMergedCurveCorrection(merged,
+                    profile.Select(x => x.component), profile.Select(x => x.root));
                 ApplyMergedIgnoreTransforms(merged, profile.Select(x => x.component), profile.Select(x => x.root));
                 ClearRootTransform(merged);
                 SetEnumByName(merged, "multiChildType", "Ignore");
@@ -486,7 +520,7 @@ namespace VRCBoneMerger
             return EnumerateAffectedTransforms(root, component).Count();
         }
 
-        private static int GetMaxChainDepth(Transform root, VRCPhysBone component)
+        internal static int GetMaxChainDepth(Transform root, VRCPhysBone component)
         {
             var ignored = new HashSet<Transform>(component.ignoreTransforms ?? new List<Transform>());
             return GetDepth(root);
@@ -499,6 +533,74 @@ namespace VRCBoneMerger
                     childDepth = Math.Max(childDepth, GetDepth(node.GetChild(i)));
                 return childDepth + 1;
             }
+        }
+
+        private static int GetBoneChainLength(Transform root, VRCPhysBone component)
+        {
+            int maxBoneChainIndex = Math.Max(0, GetMaxChainDepth(root, component) - 1);
+            if (component != null && component.endpointPosition != Vector3.zero) maxBoneChainIndex++;
+            return maxBoneChainIndex;
+        }
+
+        internal static void ApplyMergedCurveCorrection(VRCPhysBone merged,
+            IEnumerable<VRCPhysBone> sourceComponents, IEnumerable<Transform> sourceRoots)
+        {
+            if (merged == null || sourceComponents == null || sourceRoots == null) return;
+            VRCPhysBone[] components = sourceComponents.ToArray();
+            Transform[] roots = sourceRoots.ToArray();
+            int count = Math.Min(components.Length, roots.Length);
+            if (count == 0) return;
+
+            int maxChainLength = Enumerable.Range(0, count)
+                .Where(index => components[index] != null && roots[index] != null)
+                .Select(index => GetBoneChainLength(roots[index], components[index]))
+                .DefaultIfEmpty(0)
+                .Max();
+            int boneCurveLength = maxChainLength - 1;
+
+            merged.pullCurve = FixCurveForMergedRoot(merged.pullCurve, boneCurveLength);
+            merged.springCurve = FixCurveForMergedRoot(merged.springCurve, boneCurveLength);
+            merged.stiffnessCurve = FixCurveForMergedRoot(merged.stiffnessCurve, boneCurveLength);
+            merged.gravityCurve = FixCurveForMergedRoot(merged.gravityCurve, boneCurveLength);
+            merged.gravityFalloffCurve = FixCurveForMergedRoot(merged.gravityFalloffCurve, boneCurveLength);
+            merged.immobileCurve = FixCurveForMergedRoot(merged.immobileCurve, boneCurveLength);
+            merged.maxAngleXCurve = FixCurveForMergedRoot(merged.maxAngleXCurve, boneCurveLength);
+            merged.maxAngleZCurve = FixCurveForMergedRoot(merged.maxAngleZCurve, boneCurveLength);
+            merged.limitRotationXCurve = FixCurveForMergedRoot(merged.limitRotationXCurve, boneCurveLength);
+            merged.limitRotationYCurve = FixCurveForMergedRoot(merged.limitRotationYCurve, boneCurveLength);
+            merged.limitRotationZCurve = FixCurveForMergedRoot(merged.limitRotationZCurve, boneCurveLength);
+            merged.radiusCurve = FixCurveForMergedRoot(merged.radiusCurve, maxChainLength);
+            merged.stretchMotionCurve = FixCurveForMergedRoot(merged.stretchMotionCurve, boneCurveLength);
+            merged.maxStretchCurve = FixCurveForMergedRoot(merged.maxStretchCurve, boneCurveLength);
+            merged.maxSquishCurve = FixCurveForMergedRoot(merged.maxSquishCurve, boneCurveLength);
+        }
+
+        private static AnimationCurve FixCurveForMergedRoot(AnimationCurve curve, int chainLength)
+        {
+            if (curve == null || curve.length == 0) return new AnimationCurve();
+            if (chainLength <= 0)
+            {
+                float value = curve.Evaluate(0f);
+                return AnimationCurve.Constant(0f, 1f, value);
+            }
+
+            float offset = 1f / (chainLength + 1f);
+            float tangentRatio = (chainLength + 1f) / chainLength;
+            Keyframe[] keys = curve.keys;
+            for (int index = 0; index < keys.Length; index++)
+            {
+                Keyframe key = keys[index];
+                key.time = Mathf.LerpUnclamped(offset, 1f, key.time);
+                key.inTangent *= tangentRatio;
+                key.outTangent *= tangentRatio;
+                keys[index] = key;
+            }
+
+            return new AnimationCurve(keys)
+            {
+                preWrapMode = curve.preWrapMode,
+                postWrapMode = curve.postWrapMode
+            };
         }
 
         private static IEnumerable<Transform> EnumerateAffectedTransforms(Transform root, VRCPhysBone component)
@@ -530,22 +632,24 @@ namespace VRCBoneMerger
         private static bool HasHumanoidPathDependency(Transform avatarRoot, Transform candidate)
         {
             if (avatarRoot == null || candidate == null) return false;
-            foreach (Animator animator in avatarRoot.GetComponentsInChildren<Animator>(true))
+            // Only the Animator on the avatar descriptor root defines the avatar's
+            // Humanoid skeleton. Outfit/accessory prefabs can contain their own
+            // Humanoid Animator; treating those as the avatar skeleton creates
+            // false positives for otherwise independent clothing PhysBone roots.
+            Animator animator = avatarRoot.GetComponent<Animator>();
+            if (animator == null || animator.avatar == null || !animator.avatar.isHuman) return false;
+            for (HumanBodyBones bone = HumanBodyBones.Hips; bone < HumanBodyBones.LastBone; bone++)
             {
-                if (animator == null || animator.avatar == null || !animator.avatar.isHuman) continue;
-                for (HumanBodyBones bone = HumanBodyBones.Hips; bone < HumanBodyBones.LastBone; bone++)
+                Transform mapped;
+                try
                 {
-                    Transform mapped;
-                    try
-                    {
-                        mapped = animator.GetBoneTransform(bone);
-                    }
-                    catch (InvalidOperationException)
-                    {
-                        continue;
-                    }
-                    if (mapped != null && (mapped == candidate || mapped.IsChildOf(candidate))) return true;
+                    mapped = animator.GetBoneTransform(bone);
                 }
+                catch (InvalidOperationException)
+                {
+                    continue;
+                }
+                if (mapped != null && (mapped == candidate || mapped.IsChildOf(candidate))) return true;
             }
             return false;
         }
