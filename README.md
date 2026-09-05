@@ -4,7 +4,7 @@
 
 ## 安装
 
-项目需先安装 VRChat Avatars SDK、NDMF。导入 `VRCBoneMerger.unitypackage` 即可；不要同时安装 UnityPackage 和本地 UPM 版本。
+项目需先安装 VRChat Avatars SDK、NDMF。导入 `VRCBoneMerger.unitypackage` 即可
 
 ## 使用
 
